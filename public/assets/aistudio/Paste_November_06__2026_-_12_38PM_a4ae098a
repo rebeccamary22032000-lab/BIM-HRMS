@@ -1,0 +1,1993 @@
+/**
+ * BIM BYTES — TIME TRACKER + QC ERROR LOG
+ * Sheet tabs: Employees, TimeLog, QCLog (+ auto-created tabs)
+ *
+ * FIXES IN THIS VERSION
+ *  - Open session = RUNNING/ON BREAK and EndTime empty (manual edits can't leave ghosts)
+ *  - Stale sessions from earlier days auto-close (login + nightly trigger)
+ *  - LockService on start/end/break so double taps / two devices can't race
+ *  - EVERY append goes through safeAppend_ (trims blank cells and retries)
+ *  - New tabs are created small, so they don't eat the 10M cell limit
+ *  - fixFormats() keeps durations as text (avoids the ~23 min timezone drift)
+ *
+ * RUN ONCE from the editor: fixFormats(), setupDailyTriggers(), checkWorkbookSize()
+ */
+
+const SHIFT_START = '09:30';
+const SHIFT_END = '18:30';
+const TZ = Session.getScriptTimeZone();
+
+// ---------- WEB APP ENTRY ----------
+function doGet(e) {
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('BIM Bytes — Tracker')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+function include(filename) { return HtmlService.createHtmlOutputFromFile(filename).getContent(); }
+
+// ---------- HELPERS ----------
+function fmtDate_(d) { return Utilities.formatDate(d, TZ, 'yyyy-MM-dd'); }
+function fmtTime_(d) { return Utilities.formatDate(d, TZ, 'HH:mm'); }
+
+function fmtHMS_(ms) {
+  if (!ms || ms < 0) ms = 0;
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return [h, m, s].map(n => String(n).padStart(2, '0')).join(':');
+}
+
+function parseDurationToMs_(val) {
+  if (!val || val === '') return 0;
+  if (Object.prototype.toString.call(val) === '[object Date]') {
+    return (val.getHours() * 3600 + val.getMinutes() * 60 + val.getSeconds()) * 1000;
+  }
+  const parts = String(val).split(':').map(Number);
+  if (parts.length === 3 && !parts.some(isNaN)) {
+    return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
+  }
+  return 0;
+}
+
+function sheet_(name) { return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name); }
+
+function normalizeDateCell_(val) {
+  if (Object.prototype.toString.call(val) === '[object Date]') return fmtDate_(val);
+  return String(val || '').trim();
+}
+
+function deriveDiscipline_(designation) {
+  const d = String(designation || '').toUpperCase();
+  if (d.indexOf('MECHANICAL') !== -1) return 'Mechanical';
+  if (d.indexOf('ELECTRICAL') !== -1) return 'Electrical';
+  return '';
+}
+
+// ============================================================
+// SPREADSHEET SIZE CARE (10,000,000 cells per workbook, blanks included)
+// ============================================================
+function checkWorkbookSize() {
+  let total = 0;
+  SpreadsheetApp.getActiveSpreadsheet().getSheets().forEach(sh => {
+    const cells = sh.getMaxRows() * sh.getMaxColumns();
+    total += cells;
+    Logger.log(sh.getName() + ': ' + sh.getMaxRows() + ' rows x ' + sh.getMaxColumns() +
+      ' cols = ' + cells + ' cells (data rows: ' + sh.getLastRow() + ')');
+  });
+  Logger.log('TOTAL: ' + total + ' / 10,000,000');
+}
+
+function trimWorkbook_() {
+  SpreadsheetApp.getActiveSpreadsheet().getSheets().forEach(sh => {
+    try {
+      const maxR = sh.getMaxRows(), lastR = Math.max(sh.getLastRow(), 1);
+      if (maxR - lastR > 50) sh.deleteRows(lastR + 51, maxR - lastR - 50);
+      const maxC = sh.getMaxColumns(), lastC = Math.max(sh.getLastColumn(), 1);
+      if (maxC - lastC > 2) sh.deleteColumns(lastC + 3, maxC - lastC - 2);
+    } catch (e) { Logger.log('trim skipped ' + sh.getName() + ': ' + e.message); }
+  });
+}
+
+// The ONLY place that calls appendRow. Trims and retries if the workbook is full.
+function safeAppend_(sh, rowArray) {
+  try {
+    sh.appendRow(rowArray);
+  } catch (err) {
+    try {
+      trimWorkbook_();
+      SpreadsheetApp.flush();
+      sh.appendRow(rowArray);
+    } catch (err2) {
+      throw new Error('Spreadsheet is full (10M cell limit). Run archiveOldRows() or delete unused tabs. ' + err2.message);
+    }
+  }
+}
+
+// Creates a new tab with only a small grid so it doesn't waste cells.
+function createSheet_(name, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh;
+  try {
+    sh = ss.insertSheet(name);
+  } catch (e) {
+    trimWorkbook_();
+    SpreadsheetApp.flush();
+    sh = ss.insertSheet(name);
+  }
+  sh.appendRow(headers);
+  try {
+    const mr = sh.getMaxRows();
+    if (mr > 200) sh.deleteRows(201, mr - 200);
+    const mc = sh.getMaxColumns();
+    if (mc > headers.length + 2) sh.deleteColumns(headers.length + 3, mc - headers.length - 2);
+  } catch (e) { /* non-fatal */ }
+  SpreadsheetApp.flush();
+  return sh;
+}
+
+function getOrCreateSheet_(name, headers) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  return sh || createSheet_(name, headers);
+}
+
+// Run ONCE: keeps duration columns as plain text (stops Sheets turning
+// "08:30:00" into a time value, which causes small hour errors).
+function fixFormats() {
+  const sh = sheet_('TimeLog');
+  ['I', 'N', 'O'].forEach(c => sh.getRange(c + ':' + c).setNumberFormat('@'));
+  Logger.log('TimeLog duration columns set to plain text.');
+}
+
+function archiveOldRows(daysToKeep) {
+  daysToKeep = daysToKeep || 60;
+  const cutoff = new Date(Date.now() - daysToKeep * 86400000);
+  const files = DriveApp.getFilesByName('BIM Bytes Archive');
+  const archive = files.hasNext() ? SpreadsheetApp.open(files.next()) : SpreadsheetApp.create('BIM Bytes Archive');
+
+  ['Notifications', 'Messages'].forEach(name => {
+    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+    if (!sh || sh.getLastRow() < 2) return;
+    const data = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+    let k = 0;
+    while (k < data.length && data[k][0] && new Date(data[k][0]) < cutoff) k++;
+    if (!k) return;
+    const dest = archive.getSheetByName(name) || archive.insertSheet(name);
+    dest.getRange(dest.getLastRow() + 1, 1, k, data[0].length).setValues(data.slice(0, k));
+    sh.deleteRows(2, k);
+    Logger.log('Archived ' + k + ' rows from ' + name);
+  });
+}
+
+function setupDailyTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'nightlyMaintenance') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('nightlyMaintenance').timeBased().everyDays(1).atHour(1).create();
+}
+
+function nightlyMaintenance() {
+  withLock_(() => autoCloseStaleSessions_(null));
+  trimWorkbook_();
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+// ---------- AUTH ----------
+function authenticateUser(username, password) {
+  const sh = sheet_('Employees');
+  if (!sh) return { success: false, message: 'Employees sheet not found.' };
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const empName = row[0], pass = row[1], role = row[2], designation = row[3];
+    if (String(empName).trim() === String(username).trim() &&
+        String(pass).trim() === String(password).trim()) {
+      const photoUrl = row[5] ? String(row[5]).trim() : '';
+      return { success: true, name: empName, role: role,
+        discipline: deriveDiscipline_(designation), photoUrl: photoUrl };
+    }
+  }
+  return { success: false, message: 'Invalid username or password.' };
+}
+
+function changePassword(name, currentPassword, newPassword) {
+  if (!newPassword || String(newPassword).trim().length < 4) {
+    return { success: false, message: 'New password must be at least 4 characters.' };
+  }
+  const sh = sheet_('Employees');
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(name).trim()) {
+      if (String(data[i][1]).trim() !== String(currentPassword).trim()) {
+        return { success: false, message: 'Current password is incorrect.' };
+      }
+      sh.getRange(i + 1, 2).setValue(String(newPassword).trim());
+      return { success: true, message: '✔ Password updated.' };
+    }
+  }
+  return { success: false, message: 'Employee not found.' };
+}
+
+function getTeamRoster() {
+  const sh = sheet_('Employees');
+  const data = sh.getDataRange().getValues();
+  const roster = [];
+  for (let i = 1; i < data.length; i++) {
+    if (!data[i][0]) continue;
+    roster.push({
+      name: String(data[i][0]).trim(),
+      role: data[i][2] || '',
+      photoUrl: data[i][5] ? String(data[i][5]).trim() : ''
+    });
+  }
+  return roster;
+}
+
+// ============================================================
+// IMAGE UPLOADS (Drive)
+// ============================================================
+function getOrCreateUploadsFolder_() {
+  const folderName = 'BIM Bytes Uploads';
+  const folders = DriveApp.getFoldersByName(folderName);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(folderName);
+}
+
+function uploadImageToDrive(base64DataUrl, filename) {
+  try {
+    const matches = String(base64DataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!matches) return { success: false, message: 'Invalid image data.' };
+    const bytes = Utilities.base64Decode(matches[2]);
+    const blob = Utilities.newBlob(bytes, matches[1], filename || ('upload_' + new Date().getTime()));
+    const file = getOrCreateUploadsFolder_().createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return { success: true, url: 'https://lh3.googleusercontent.com/d/' + file.getId() };
+  } catch (err) {
+    return { success: false, message: 'Drive upload failed: ' + err.message };
+  }
+}
+
+// ============================================================
+// CIRCULARS
+// ============================================================
+function ensureCircularsSheet_() {
+  return getOrCreateSheet_('Circulars', ['Timestamp', 'PostedBy', 'Title', 'Message', 'ImageUrl', 'Author', 'ThumbnailUrl']);
+}
+
+function postCircular(role, name, title, message, imageUrl, author, thumbnailUrl) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!title || !String(title).trim()) return { success: false, message: 'Title is required.' };
+  if (imageUrl && imageUrl.length > 45000) return { success: false, message: 'Poster image too large even after compression — try a smaller or simpler image.' };
+  if (thumbnailUrl && thumbnailUrl.length > 45000) return { success: false, message: 'Thumbnail image too large even after compression.' };
+  const sh = ensureCircularsSheet_();
+  safeAppend_(sh, [new Date(), name, String(title).trim(), String(message || '').trim(),
+    String(imageUrl || '').trim(), String(author || '').trim(), String(thumbnailUrl || '').trim()]);
+  return { success: true, message: '✔ Circular posted.' };
+}
+
+function getCirculars(limit) {
+  limit = limit || 10;
+  try {
+    const sh = ensureCircularsSheet_();
+    const data = sh.getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][2]) continue;
+      rows.push({
+        circularRow: i + 1,
+        timestamp: data[i][0] ? fmtDate_(new Date(data[i][0])) : '',
+        postedBy: data[i][1], title: data[i][2], message: data[i][3],
+        imageUrl: data[i][4], author: data[i][5] || '', thumbnailUrl: data[i][6] || ''
+      });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load circulars: ' + err.message };
+  }
+}
+
+function editCircular(role, circularRow, title, message, imageUrl, author, thumbnailUrl) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!title || !String(title).trim()) return { success: false, message: 'Title is required.' };
+  if (imageUrl && imageUrl.length > 45000) return { success: false, message: 'Poster image too large even after compression.' };
+  if (thumbnailUrl && thumbnailUrl.length > 45000) return { success: false, message: 'Thumbnail image too large even after compression.' };
+  const sh = ensureCircularsSheet_();
+  sh.getRange(circularRow, 3).setValue(String(title).trim());
+  sh.getRange(circularRow, 4).setValue(String(message || '').trim());
+  if (imageUrl) sh.getRange(circularRow, 5).setValue(imageUrl);
+  sh.getRange(circularRow, 6).setValue(String(author || '').trim());
+  if (thumbnailUrl) sh.getRange(circularRow, 7).setValue(thumbnailUrl);
+  return { success: true, message: '✔ Circular updated.' };
+}
+
+function deleteCircular(role, circularRow) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  ensureCircularsSheet_().deleteRow(circularRow);
+  return { success: true, message: '✔ Circular deleted.' };
+}
+
+// ============================================================
+// POSTERS
+// ============================================================
+function ensurePostersSheet_() {
+  return getOrCreateSheet_('Posters', ['Timestamp', 'PostedBy', 'Title', 'Message', 'ImageUrl', 'Author']);
+}
+
+function postPoster(role, name, title, message, imageUrl, author) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!imageUrl) return { success: false, message: 'A poster image is required.' };
+  if (imageUrl.length > 45000) return { success: false, message: 'Poster image too large even after compression.' };
+  safeAppend_(ensurePostersSheet_(), [new Date(), name, String(title || '').trim(), String(message || '').trim(), imageUrl, String(author || '').trim()]);
+  return { success: true, message: '✔ Poster posted.' };
+}
+
+function getPosters(limit) {
+  limit = limit || 15;
+  try {
+    const data = ensurePostersSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][4]) continue;
+      rows.push({
+        posterRow: i + 1,
+        timestamp: data[i][0] ? fmtDate_(new Date(data[i][0])) : '',
+        postedBy: data[i][1], title: data[i][2], message: data[i][3],
+        imageUrl: data[i][4], author: data[i][5] || ''
+      });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load posters: ' + err.message };
+  }
+}
+
+function deletePoster(role, posterRow) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  ensurePostersSheet_().deleteRow(posterRow);
+  return { success: true, message: '✔ Poster deleted.' };
+}
+
+// ============================================================
+// CIRCULAR REACTIONS / REPLIES
+// ============================================================
+function ensureCircularReactionsSheet_() {
+  return getOrCreateSheet_('CircularReactions', ['CircularRow', 'EmployeeName', 'Emoji', 'Timestamp']);
+}
+
+function toggleCircularReaction(name, circularRow, emoji) {
+  const sh = ensureCircularReactionsSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (Number(data[i][0]) === Number(circularRow) && String(data[i][1]).trim() === String(name).trim()) {
+      if (String(data[i][2]) === emoji) { sh.deleteRow(i + 1); return { success: true }; }
+      sh.getRange(i + 1, 3).setValue(emoji);
+      sh.getRange(i + 1, 4).setValue(new Date());
+      return { success: true };
+    }
+  }
+  safeAppend_(sh, [circularRow, name, emoji, new Date()]);
+  return { success: true };
+}
+
+function getAllCircularReactions() {
+  try {
+    const data = ensureCircularReactionsSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][1]) continue;
+      rows.push({ circularRow: Number(data[i][0]), name: data[i][1], emoji: data[i][2] });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load reactions: ' + err.message };
+  }
+}
+
+function ensureCircularRepliesSheet_() {
+  return getOrCreateSheet_('CircularReplies', ['CircularRow', 'Name', 'Message', 'Timestamp']);
+}
+
+function addCircularReply(name, circularRow, message) {
+  if (!message || !String(message).trim()) return { success: false, message: 'Reply cannot be empty.' };
+  safeAppend_(ensureCircularRepliesSheet_(), [circularRow, name, String(message).trim(), new Date()]);
+  return { success: true, message: '✔ Reply posted.' };
+}
+
+function getAllCircularReplies() {
+  try {
+    const data = ensureCircularRepliesSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][1]) continue;
+      rows.push({
+        circularRow: Number(data[i][0]), name: data[i][1], message: data[i][2],
+        timestamp: data[i][3] ? fmtTime_(new Date(data[i][3])) + ' · ' + fmtDate_(new Date(data[i][3])) : ''
+      });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load replies: ' + err.message };
+  }
+}
+
+// ============================================================
+// POSTER REACTIONS / REPLIES
+// ============================================================
+function ensurePosterReactionsSheet_() {
+  return getOrCreateSheet_('PosterReactions', ['PosterRow', 'EmployeeName', 'Emoji', 'Timestamp']);
+}
+
+function togglePosterReaction(name, posterRow, emoji) {
+  const sh = ensurePosterReactionsSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (Number(data[i][0]) === Number(posterRow) && String(data[i][1]).trim() === String(name).trim()) {
+      if (String(data[i][2]) === emoji) { sh.deleteRow(i + 1); return { success: true }; }
+      sh.getRange(i + 1, 3).setValue(emoji);
+      sh.getRange(i + 1, 4).setValue(new Date());
+      return { success: true };
+    }
+  }
+  safeAppend_(sh, [posterRow, name, emoji, new Date()]);
+  return { success: true };
+}
+
+function getAllPosterReactions() {
+  try {
+    const data = ensurePosterReactionsSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][1]) continue;
+      rows.push({ posterRow: Number(data[i][0]), name: data[i][1], emoji: data[i][2] });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load reactions: ' + err.message };
+  }
+}
+
+function ensurePosterRepliesSheet_() {
+  return getOrCreateSheet_('PosterReplies', ['PosterRow', 'Name', 'Message', 'Timestamp']);
+}
+
+function addPosterReply(name, posterRow, message) {
+  if (!message || !String(message).trim()) return { success: false, message: 'Reply cannot be empty.' };
+  safeAppend_(ensurePosterRepliesSheet_(), [posterRow, name, String(message).trim(), new Date()]);
+  return { success: true, message: '✔ Reply posted.' };
+}
+
+function getAllPosterReplies() {
+  try {
+    const data = ensurePosterRepliesSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][1]) continue;
+      rows.push({
+        posterRow: Number(data[i][0]), name: data[i][1], message: data[i][2],
+        timestamp: data[i][3] ? fmtTime_(new Date(data[i][3])) + ' · ' + fmtDate_(new Date(data[i][3])) : ''
+      });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load replies: ' + err.message };
+  }
+}
+
+// ============================================================
+// MESSAGES + GROUPS
+// ============================================================
+function ensureMessagesSheet_() {
+  return getOrCreateSheet_('Messages', ['Timestamp', 'Sender', 'Recipient', 'Message', 'Read', 'ImageUrl', 'GroupId']);
+}
+function ensureGroupsSheet_() {
+  return getOrCreateSheet_('Groups', ['GroupId', 'GroupName', 'CreatedBy', 'Members', 'CreatedAt']);
+}
+
+// TIP: move this key into Project Settings > Script properties (GIPHY_API_KEY)
+// so it isn't visible in the code. Falls back to the constant below.
+const GIPHY_API_KEY_FALLBACK = 'DSVjcbzOOLUMLLQv8nFklj4ao6O0phzQ';
+function giphyKey_() {
+  return PropertiesService.getScriptProperties().getProperty('GIPHY_API_KEY') || GIPHY_API_KEY_FALLBACK;
+}
+
+function searchGiphy(query, type) {
+  try {
+    const endpoint = (type === 'stickers') ? 'stickers' : 'gifs';
+    let url;
+    if (query && String(query).trim()) {
+      url = 'https://api.giphy.com/v1/' + endpoint + '/search?api_key=' + giphyKey_() +
+            '&q=' + encodeURIComponent(String(query).trim()) + '&limit=15&rating=g';
+    } else {
+      url = 'https://api.giphy.com/v1/' + endpoint + '/trending?api_key=' + giphyKey_() + '&limit=15&rating=g';
+    }
+    const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    const data = JSON.parse(response.getContentText());
+    if (!data || !data.data) return { error: 'No results from GIPHY.' };
+    return data.data.map(item => ({
+      id: item.id,
+      preview: (item.images.fixed_width_small || item.images.fixed_width).url,
+      full: item.images.fixed_width.url
+    }));
+  } catch (err) {
+    return { error: 'GIPHY search failed: ' + err.message };
+  }
+}
+
+function sendMessage(sender, recipient, message, imageUrl) {
+  if (!recipient || ((!message || !String(message).trim()) && !imageUrl)) {
+    return { success: false, message: 'Recipient and a message or photo are required.' };
+  }
+  if (imageUrl && imageUrl.length > 45000) return { success: false, message: 'Photo too large even after compression.' };
+  safeAppend_(ensureMessagesSheet_(), [new Date(), sender, recipient, String(message || '').trim(), 'No', imageUrl || '', '']);
+  logNotification_('NEW_MESSAGE', recipient, sender, '', '', '',
+    'New message from ' + sender + (message ? ': ' + String(message).slice(0, 60) : ' (photo)'), '', '');
+  return { success: true, message: '✔ Sent.' };
+}
+
+function getConversation(name, otherName, limit) {
+  limit = limit || 100;
+  try {
+    const data = ensureMessagesSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][6]) continue;
+      const sender = String(data[i][1]).trim(), recipient = String(data[i][2]).trim();
+      const between =
+        (sender === String(name).trim() && recipient === String(otherName).trim()) ||
+        (sender === String(otherName).trim() && recipient === String(name).trim());
+      if (!between) continue;
+      rows.push({
+        sender: data[i][1], message: data[i][3], imageUrl: data[i][5] || '',
+        timestamp: data[i][0] ? fmtTime_(new Date(data[i][0])) + ' · ' + fmtDate_(new Date(data[i][0])) : '',
+        mine: sender === String(name).trim()
+      });
+    }
+    return rows.slice(-limit);
+  } catch (err) {
+    return { error: 'Could not load conversation: ' + err.message };
+  }
+}
+
+function markConversationRead(name, otherName) {
+  const sh = ensureMessagesSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (!data[i][6] &&
+        String(data[i][2]).trim() === String(name).trim() &&
+        String(data[i][1]).trim() === String(otherName).trim() &&
+        data[i][4] !== 'Yes') {
+      sh.getRange(i + 1, 5).setValue('Yes');
+    }
+  }
+  return { success: true };
+}
+
+function getConversationList(name) {
+  try {
+    const data = ensureMessagesSheet_().getDataRange().getValues();
+    const convos = {};
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][6]) continue;
+      const sender = String(data[i][1]).trim(), recipient = String(data[i][2]).trim();
+      let other = null, incoming = false;
+      if (sender === String(name).trim()) other = recipient;
+      else if (recipient === String(name).trim()) { other = sender; incoming = true; }
+      if (!other) continue;
+      if (!convos[other]) convos[other] = { name: other, lastMessage: '', lastTimestamp: '', unread: 0 };
+      convos[other].lastMessage = data[i][3] || (data[i][5] ? '📷 Photo' : '');
+      convos[other].lastTimestamp = data[i][0] ? fmtTime_(new Date(data[i][0])) + ' · ' + fmtDate_(new Date(data[i][0])) : '';
+      if (incoming && data[i][4] !== 'Yes') convos[other].unread++;
+    }
+    return Object.keys(convos).map(k => convos[k]);
+  } catch (err) {
+    return { error: 'Could not load conversations: ' + err.message };
+  }
+}
+
+function countUnreadMessages(name) {
+  const data = ensureMessagesSheet_().getDataRange().getValues();
+  let count = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (!data[i][6] && String(data[i][2]).trim() === String(name).trim() && data[i][4] !== 'Yes') count++;
+  }
+  return count;
+}
+
+function createGroup(creatorName, groupName, memberNamesCsv) {
+  if (!groupName || !String(groupName).trim()) return { success: false, message: 'Group name is required.' };
+  const members = String(memberNamesCsv || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (members.indexOf(creatorName) === -1) members.push(creatorName);
+  if (members.length < 2) return { success: false, message: 'Pick at least one other member.' };
+  const groupId = 'G' + new Date().getTime();
+  safeAppend_(ensureGroupsSheet_(), [groupId, String(groupName).trim(), creatorName, members.join(','), new Date()]);
+  return { success: true, message: '✔ Group "' + groupName + '" created.', groupId: groupId };
+}
+
+function getMyGroups(name) {
+  try {
+    const data = ensureGroupsSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0]) continue;
+      const members = String(data[i][3] || '').split(',').map(s => s.trim());
+      if (members.indexOf(String(name).trim()) === -1) continue;
+      rows.push({ groupId: data[i][0], groupName: data[i][1], members: members });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load groups: ' + err.message };
+  }
+}
+
+function sendGroupMessage(sender, groupId, message, imageUrl) {
+  if (!groupId || ((!message || !String(message).trim()) && !imageUrl)) {
+    return { success: false, message: 'Group and a message or photo are required.' };
+  }
+  if (imageUrl && imageUrl.length > 45000) return { success: false, message: 'Photo too large even after compression.' };
+  safeAppend_(ensureMessagesSheet_(), [new Date(), sender, '', String(message || '').trim(), 'No', imageUrl || '', groupId]);
+  try {
+    const groupData = ensureGroupsSheet_().getDataRange().getValues();
+    for (let i = 1; i < groupData.length; i++) {
+      if (String(groupData[i][0]).trim() !== String(groupId).trim()) continue;
+      const groupName = groupData[i][1];
+      const members = String(groupData[i][3] || '').split(',').map(s => s.trim());
+      members.filter(m => m !== sender).forEach(m => {
+        logNotification_('NEW_GROUP_MESSAGE', m, sender, '', '', '',
+          'New message from ' + sender + ' in "' + groupName + '"' + (message ? ': ' + String(message).slice(0, 50) : ' (photo)'), '', '');
+      });
+      break;
+    }
+  } catch (err) { /* best-effort */ }
+  return { success: true, message: '✔ Sent.' };
+}
+
+function getGroupConversation(groupId, limit) {
+  limit = limit || 150;
+  try {
+    const data = ensureMessagesSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][6]).trim() !== String(groupId).trim()) continue;
+      rows.push({
+        sender: data[i][1], message: data[i][3], imageUrl: data[i][5] || '',
+        timestamp: data[i][0] ? fmtTime_(new Date(data[i][0])) + ' · ' + fmtDate_(new Date(data[i][0])) : ''
+      });
+    }
+    return rows.slice(-limit);
+  } catch (err) {
+    return { error: 'Could not load group conversation: ' + err.message };
+  }
+}
+
+// ============================================================
+// HOLIDAYS
+// ============================================================
+function ensureHolidaysSheet_() {
+  return getOrCreateSheet_('Holidays', ['Date', 'Description', 'AddedBy']);
+}
+
+function addHoliday(role, name, dateStr, description) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!dateStr) return { success: false, message: 'Date is required.' };
+  safeAppend_(ensureHolidaysSheet_(), [dateStr, String(description || '').trim(), name]);
+  return { success: true, message: '✔ Holiday added.' };
+}
+
+function getUpcomingHolidays(limit) {
+  limit = limit || 10;
+  try {
+    const data = ensureHolidaysSheet_().getDataRange().getValues();
+    const today = fmtDate_(new Date());
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0]) continue;
+      const dateStr = normalizeDateCell_(data[i][0]);
+      if (dateStr < today) continue;
+      rows.push({ date: dateStr, description: data[i][1] });
+    }
+    rows.sort((a, b) => a.date < b.date ? -1 : 1);
+    return rows.slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load holidays: ' + err.message };
+  }
+}
+
+// ============================================================
+// MY WORK CALENDAR
+// ============================================================
+function getMyCalendarData(name) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][1]).trim() !== String(name).trim()) continue;
+    rows.push({
+      date: normalizeDateCell_(data[i][0]),
+      project: data[i][2], taskType: data[i][3], subTask: data[i][4],
+      clockIn: data[i][6] ? fmtTime_(new Date(data[i][6])) : '',
+      clockOut: data[i][7] ? fmtTime_(new Date(data[i][7])) : '',
+      netHrs: Math.round((parseDurationToMs_(data[i][14]) / 3600000) * 100) / 100
+    });
+  }
+  return rows;
+}
+
+// ============================================================
+// MEMOS / WARNINGS
+// ============================================================
+function ensureMemosSheet_() {
+  return getOrCreateSheet_('Memos', ['Timestamp', 'IssuedBy', 'TargetEmployee', 'Type', 'Message', 'Reply', 'RepliedAt', 'Read']);
+}
+
+function issueMemo(role, issuedBy, targetEmployee, type, message) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!targetEmployee || !message || !String(message).trim()) return { success: false, message: 'Employee and message are required.' };
+  safeAppend_(ensureMemosSheet_(), [new Date(), issuedBy, targetEmployee, type || 'Memo', String(message).trim(), '', '', 'No']);
+  logNotification_((type === 'Warning' ? 'WARNING_ISSUED' : 'MEMO_ISSUED'), targetEmployee, issuedBy, '', '', '',
+    'You have a new ' + (type || 'Memo') + ' from ' + issuedBy + '.', '', '');
+  return { success: true, message: '✔ ' + (type || 'Memo') + ' issued to ' + targetEmployee + '.' };
+}
+
+function getMyMemos(name, limit) {
+  limit = limit || 30;
+  try {
+    const data = ensureMemosSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][2]).trim() !== String(name).trim()) continue;
+      rows.push({
+        memoRow: i + 1,
+        timestamp: data[i][0] ? fmtDate_(new Date(data[i][0])) + ' ' + fmtTime_(new Date(data[i][0])) : '',
+        issuedBy: data[i][1], type: data[i][3], message: data[i][4],
+        reply: data[i][5] || '', repliedAt: data[i][6] ? fmtDate_(new Date(data[i][6])) : ''
+      });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load memos: ' + err.message };
+  }
+}
+
+function countUnreadMemos(name) {
+  const data = ensureMemosSheet_().getDataRange().getValues();
+  let count = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][2]).trim() === String(name).trim() && data[i][7] !== 'Yes') count++;
+  }
+  return count;
+}
+
+function markMemosRead(name) {
+  const sh = ensureMemosSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][2]).trim() === String(name).trim() && data[i][7] !== 'Yes') {
+      sh.getRange(i + 1, 8).setValue('Yes');
+    }
+  }
+  return { success: true };
+}
+
+function replyToMemo(name, memoRow, replyText) {
+  if (!replyText || !String(replyText).trim()) return { success: false, message: 'Reply cannot be empty.' };
+  const sh = ensureMemosSheet_();
+  const row = sh.getRange(memoRow, 1, 1, 3).getValues()[0];
+  if (String(row[2]).trim() !== String(name).trim()) return { success: false, message: 'Not your memo.' };
+  sh.getRange(memoRow, 6).setValue(String(replyText).trim());
+  sh.getRange(memoRow, 7).setValue(new Date());
+  return { success: true, message: '✔ Reply sent.' };
+}
+
+function getAllMemos(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  limit = limit || 50;
+  try {
+    const data = ensureMemosSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][2]) continue;
+      rows.push({
+        memoRow: i + 1,
+        timestamp: data[i][0] ? fmtDate_(new Date(data[i][0])) : '',
+        issuedBy: data[i][1], targetEmployee: data[i][2], type: data[i][3], message: data[i][4],
+        reply: data[i][5] || '', repliedAt: data[i][6] ? fmtDate_(new Date(data[i][6])) : ''
+      });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load memos: ' + err.message };
+  }
+}
+
+function editMemo(role, memoRow, type, message) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!message || !String(message).trim()) return { success: false, message: 'Message is required.' };
+  const sh = ensureMemosSheet_();
+  sh.getRange(memoRow, 4).setValue(type || 'Memo');
+  sh.getRange(memoRow, 5).setValue(String(message).trim());
+  return { success: true, message: '✔ Memo updated.' };
+}
+
+// ============================================================
+// EMPLOYEE PROFILE FIELDS (Employees cols G..M)
+// ============================================================
+function isWeekOffDay_(weekOffCsv, altSaturdayPattern, date) {
+  const dowNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const dow = dowNames[date.getDay()];
+  const weekOffDays = String(weekOffCsv || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (weekOffDays.indexOf(dow) !== -1) return true;
+  if (dow === 'Saturday' && altSaturdayPattern) {
+    const nth = Math.ceil(date.getDate() / 7);
+    if (altSaturdayPattern === '2nd4th' && (nth === 2 || nth === 4)) return true;
+    if (altSaturdayPattern === '1st3rd' && (nth === 1 || nth === 3)) return true;
+  }
+  return false;
+}
+
+function getMyProfile(name) {
+  const data = sheet_('Employees').getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(name).trim()) {
+      return {
+        joiningDate: data[i][6] ? normalizeDateCell_(data[i][6]) : '',
+        emergencyContact: data[i][7] || '',
+        address: data[i][8] || '',
+        weekOff: data[i][9] || '',
+        altSaturday: data[i][10] || '',
+        contactPersonName: data[i][11] || '',
+        contactRelation: data[i][12] || ''
+      };
+    }
+  }
+  return {};
+}
+
+function updateMyAddress(name, address) {
+  const sh = sheet_('Employees');
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(name).trim()) {
+      sh.getRange(i + 1, 9).setValue(String(address || '').trim());
+      return { success: true, message: '✔ Address updated.' };
+    }
+  }
+  return { success: false, message: 'Employee not found.' };
+}
+
+function updateEmployeeManagedFields(role, targetName, joiningDate, emergencyContact, weekOff, altSaturday, contactPersonName, contactRelation) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = sheet_('Employees');
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(targetName).trim()) {
+      if (joiningDate) sh.getRange(i + 1, 7).setValue(joiningDate);
+      sh.getRange(i + 1, 8).setValue(String(emergencyContact || '').trim());
+      sh.getRange(i + 1, 10).setValue(String(weekOff || '').trim());
+      sh.getRange(i + 1, 11).setValue(String(altSaturday || '').trim());
+      sh.getRange(i + 1, 12).setValue(String(contactPersonName || '').trim());
+      sh.getRange(i + 1, 13).setValue(String(contactRelation || '').trim());
+      return { success: true, message: '✔ Updated for ' + targetName + '.' };
+    }
+  }
+  return { success: false, message: 'Employee not found.' };
+}
+
+// ============================================================
+// LEAVE
+// ============================================================
+function ensureLeaveSheet_() {
+  return getOrCreateSheet_('Leave', ['Date', 'EmployeeName', 'Reason', 'MarkedBy', 'Status']);
+}
+
+function applySandwichLeavePolicy_(name) {
+  try {
+    const leaveSh = ensureLeaveSheet_();
+    const leaveData = leaveSh.getDataRange().getValues();
+    const approvedDates = new Set();
+    for (let i = 1; i < leaveData.length; i++) {
+      if (!leaveData[i][0]) continue;
+      if (String(leaveData[i][1]).trim() === String(name).trim() && (leaveData[i][4] || 'Approved') === 'Approved') {
+        approvedDates.add(normalizeDateCell_(leaveData[i][0]));
+      }
+    }
+    const profile = getMyProfile(name);
+    const weekOffCsv = profile.weekOff || '';
+    const altSaturday = profile.altSaturday || '';
+
+    const holidayData = ensureHolidaysSheet_().getDataRange().getValues();
+    const holidayDates = new Set();
+    for (let i = 1; i < holidayData.length; i++) {
+      if (holidayData[i][0]) holidayDates.add(normalizeDateCell_(holidayData[i][0]));
+    }
+
+    const toAdd = [];
+    approvedDates.forEach(dateStr => {
+      const d = new Date(dateStr + 'T00:00:00');
+      const nextDay = new Date(d); nextDay.setDate(d.getDate() + 1);
+      const nextDayStr = fmtDate_(nextDay);
+      const dayAfterNext = new Date(d); dayAfterNext.setDate(d.getDate() + 2);
+      const dayAfterNextStr = fmtDate_(dayAfterNext);
+      const nextIsOff = isWeekOffDay_(weekOffCsv, altSaturday, nextDay) || holidayDates.has(nextDayStr);
+      if (!approvedDates.has(nextDayStr) && nextIsOff && approvedDates.has(dayAfterNextStr) && toAdd.indexOf(nextDayStr) === -1) {
+        toAdd.push(nextDayStr);
+      }
+    });
+
+    toAdd.forEach(dateStr => {
+      const note = holidayDates.has(dateStr)
+        ? 'Sandwich policy — public holiday between two leave days'
+        : 'Sandwich policy — weekly off between two leave days';
+      safeAppend_(leaveSh, [dateStr, name, note, 'System', 'Approved']);
+    });
+  } catch (err) {
+    console.error('applySandwichLeavePolicy_ failed: ' + err.message);
+  }
+}
+
+function markLeave(role, markedBy, targetName, dateStr, reason) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!targetName || !dateStr) return { success: false, message: 'Employee and date are required.' };
+  safeAppend_(ensureLeaveSheet_(), [dateStr, targetName, String(reason || '').trim(), markedBy, 'Approved']);
+  applySandwichLeavePolicy_(targetName);
+  logNotification_('LEAVE_MARKED', 'MANAGEMENT', markedBy, '', '', '',
+    targetName + ' marked as Leave on ' + dateStr + (reason ? ' — ' + reason : '') + ' (by ' + markedBy + ').', '', '');
+  return { success: true, message: '✔ Leave marked for ' + targetName + ' on ' + dateStr + '.' };
+}
+
+function requestLeave(name, dateStr, reason) {
+  if (!dateStr) return { success: false, message: 'Date is required.' };
+  safeAppend_(ensureLeaveSheet_(), [dateStr, name, String(reason || '').trim(), name, 'Pending']);
+  logNotification_('LEAVE_REQUESTED', 'MANAGEMENT', name, '', '', '',
+    name + ' requested Leave on ' + dateStr + (reason ? ' — ' + reason : '') + '.', '', '');
+  return { success: true, message: '✔ Leave request submitted — awaiting approval.' };
+}
+
+function getPendingLeaveRequests(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  try {
+    const data = ensureLeaveSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0] || data[i][4] !== 'Pending') continue;
+      rows.push({ requestRow: i + 1, date: normalizeDateCell_(data[i][0]), name: data[i][1], reason: data[i][2] });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load leave requests: ' + err.message };
+  }
+}
+
+function decideLeaveRequest(role, reviewerName, requestRow, decision) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = ensureLeaveSheet_();
+  const row = sh.getRange(requestRow, 1, 1, 4).getValues()[0];
+  sh.getRange(requestRow, 5).setValue(decision);
+  if (decision === 'Approved') applySandwichLeavePolicy_(row[1]);
+  logNotification_(
+    decision === 'Approved' ? 'LEAVE_APPROVED' : 'LEAVE_REJECTED',
+    row[1], reviewerName, '', '', '',
+    'Your Leave request for ' + normalizeDateCell_(row[0]) + ' was ' + decision.toLowerCase() + ' by ' + reviewerName + '.', '', ''
+  );
+  return { success: true, message: '✔ Request ' + decision.toLowerCase() + '.' };
+}
+
+function getMyLeaveRequests(name, limit) {
+  limit = limit || 20;
+  try {
+    const data = ensureLeaveSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0] || String(data[i][1]).trim() !== String(name).trim()) continue;
+      rows.push({ date: normalizeDateCell_(data[i][0]), reason: data[i][2], status: data[i][4] || 'Approved' });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load your requests: ' + err.message };
+  }
+}
+
+// ============================================================
+// PERMISSION
+// ============================================================
+function ensurePermissionSheet_() {
+  return getOrCreateSheet_('Permission', ['Date', 'EmployeeName', 'Reason', 'MarkedBy', 'Status', 'Hours']);
+}
+
+function markPermission(role, markedBy, targetName, dateStr, reason, hours) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  if (!targetName || !dateStr) return { success: false, message: 'Employee and date are required.' };
+  safeAppend_(ensurePermissionSheet_(), [dateStr, targetName, String(reason || '').trim(), markedBy, 'Approved', Number(hours) || 0]);
+  logNotification_('PERMISSION_MARKED', 'MANAGEMENT', markedBy, '', '', '',
+    targetName + ' marked as Permission on ' + dateStr + (hours ? ' (' + hours + 'h)' : '') + (reason ? ' — ' + reason : '') + ' (by ' + markedBy + ').', '', '');
+  return { success: true, message: '✔ Permission marked for ' + targetName + ' on ' + dateStr + '.' };
+}
+
+function requestPermission(name, dateStr, reason, hours) {
+  if (!dateStr) return { success: false, message: 'Date is required.' };
+  safeAppend_(ensurePermissionSheet_(), [dateStr, name, String(reason || '').trim(), name, 'Pending', Number(hours) || 0]);
+  logNotification_('PERMISSION_REQUESTED', 'MANAGEMENT', name, '', '', '',
+    name + ' requested Permission on ' + dateStr + (hours ? ' (' + hours + 'h)' : '') + (reason ? ' — ' + reason : '') + '.', '', '');
+  return { success: true, message: '✔ Permission request submitted — awaiting approval.' };
+}
+
+function getPendingPermissionRequests(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  try {
+    const data = ensurePermissionSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0] || data[i][4] !== 'Pending') continue;
+      rows.push({ requestRow: i + 1, date: normalizeDateCell_(data[i][0]), name: data[i][1], reason: data[i][2], hours: Number(data[i][5]) || 0 });
+    }
+    return rows;
+  } catch (err) {
+    return { error: 'Could not load permission requests: ' + err.message };
+  }
+}
+
+function decidePermissionRequest(role, reviewerName, requestRow, decision) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = ensurePermissionSheet_();
+  const row = sh.getRange(requestRow, 1, 1, 4).getValues()[0];
+  sh.getRange(requestRow, 5).setValue(decision);
+  logNotification_(
+    decision === 'Approved' ? 'PERMISSION_APPROVED' : 'PERMISSION_REJECTED',
+    row[1], reviewerName, '', '', '',
+    'Your Permission request for ' + normalizeDateCell_(row[0]) + ' was ' + decision.toLowerCase() + ' by ' + reviewerName + '.', '', ''
+  );
+  return { success: true, message: '✔ Request ' + decision.toLowerCase() + '.' };
+}
+
+function getMyPermissionRequests(name, limit) {
+  limit = limit || 20;
+  try {
+    const data = ensurePermissionSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0] || String(data[i][1]).trim() !== String(name).trim()) continue;
+      rows.push({ date: normalizeDateCell_(data[i][0]), reason: data[i][2], status: data[i][4] || 'Approved', hours: Number(data[i][5]) || 0 });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load your requests: ' + err.message };
+  }
+}
+
+function getUpcomingPermission(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  limit = limit || 20;
+  try {
+    const data = ensurePermissionSheet_().getDataRange().getValues();
+    const today = fmtDate_(new Date());
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0]) continue;
+      if ((data[i][4] || 'Approved') !== 'Approved') continue;
+      const dateStr = normalizeDateCell_(data[i][0]);
+      if (dateStr < today) continue;
+      rows.push({ date: dateStr, name: data[i][1], reason: data[i][2], hours: Number(data[i][5]) || 0 });
+    }
+    rows.sort((a, b) => a.date < b.date ? -1 : 1);
+    return rows.slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load permissions: ' + err.message };
+  }
+}
+
+function getMyCalendarExtras(name) {
+  const leaveData = ensureLeaveSheet_().getDataRange().getValues();
+  const leaveDates = {};
+  for (let i = 1; i < leaveData.length; i++) {
+    if (!leaveData[i][0]) continue;
+    if ((leaveData[i][4] || 'Approved') !== 'Approved') continue;
+    if (String(leaveData[i][1]).trim() === String(name).trim()) {
+      leaveDates[normalizeDateCell_(leaveData[i][0])] = leaveData[i][2] || 'Leave';
+    }
+  }
+  const permData = ensurePermissionSheet_().getDataRange().getValues();
+  const permissionDates = {};
+  for (let i = 1; i < permData.length; i++) {
+    if (!permData[i][0]) continue;
+    if ((permData[i][4] || 'Approved') !== 'Approved') continue;
+    if (String(permData[i][1]).trim() === String(name).trim()) {
+      const hours = Number(permData[i][5]) || 0;
+      permissionDates[normalizeDateCell_(permData[i][0])] = { reason: permData[i][2] || 'Permission', hours: hours, late: hours > 2 };
+    }
+  }
+  const holidayData = ensureHolidaysSheet_().getDataRange().getValues();
+  const holidayDates = {};
+  for (let i = 1; i < holidayData.length; i++) {
+    if (!holidayData[i][0]) continue;
+    holidayDates[normalizeDateCell_(holidayData[i][0])] = holidayData[i][1] || 'Holiday';
+  }
+  const profile = getMyProfile(name);
+  return {
+    leaveDates: leaveDates, permissionDates: permissionDates, holidayDates: holidayDates,
+    weekOff: profile.weekOff || '', altSaturday: profile.altSaturday || ''
+  };
+}
+
+function getUpcomingLeave(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  limit = limit || 20;
+  try {
+    const data = ensureLeaveSheet_().getDataRange().getValues();
+    const today = fmtDate_(new Date());
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!data[i][0]) continue;
+      if ((data[i][4] || 'Approved') !== 'Approved') continue;
+      const dateStr = normalizeDateCell_(data[i][0]);
+      if (dateStr < today) continue;
+      rows.push({ date: dateStr, name: data[i][1], reason: data[i][2] });
+    }
+    rows.sort((a, b) => a.date < b.date ? -1 : 1);
+    return rows.slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load leave: ' + err.message };
+  }
+}
+
+function uploadMyPhoto(name, dataUrl) {
+  if (!dataUrl || dataUrl.length > 45000) {
+    return { success: false, message: 'Image too large even after compression — try a smaller or simpler photo.' };
+  }
+  const sh = sheet_('Employees');
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(name).trim()) {
+      sh.getRange(i + 1, 6).setValue(dataUrl);
+      return { success: true, message: '✔ Photo updated.' };
+    }
+  }
+  return { success: false, message: 'Employee not found.' };
+}
+
+function getUsernames() {
+  const data = sheet_('Employees').getDataRange().getValues();
+  const users = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0]) users.push({ username: data[i][0], name: data[i][0] });
+  }
+  return users;
+}
+
+function getProductionStaff() {
+  const data = sheet_('Employees').getDataRange().getValues();
+  const names = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] && data[i][2] !== 'Management') names.push(data[i][0]);
+  }
+  return names;
+}
+
+// ============================================================
+// TIME TRACKER (FIXED)
+// ============================================================
+
+// Open session = RUNNING / ON BREAK **and no EndTime**.
+function findOpenRowForUser_(name) {
+  const sh = sheet_('TimeLog');
+  const last = sh.getLastRow();
+  if (last < 2) return null;
+  const data = sh.getRange(2, 1, last - 1, 17).getValues();
+  for (let i = data.length - 1; i >= 0; i--) {
+    const r = data[i];
+    if (String(r[1]).trim() === String(name).trim() &&
+        (r[9] === 'RUNNING' || r[9] === 'ON BREAK') && !r[7]) {
+      return { rowNum: i + 2, row: r };
+    }
+  }
+  return null;
+}
+
+// Closes sessions left open on an earlier day. onlyName=null means everyone.
+function autoCloseStaleSessions_(onlyName) {
+  const sh = sheet_('TimeLog');
+  const last = sh.getLastRow();
+  if (last < 2) return 0;
+  const today = fmtDate_(new Date());
+  const data = sh.getRange(2, 1, last - 1, 17).getValues();
+  const parts = SHIFT_END.split(':').map(Number);
+  const h = parts[0], m = parts[1];
+  let closed = 0;
+
+  data.forEach((r, i) => {
+    if (r[9] !== 'RUNNING' && r[9] !== 'ON BREAK') return;
+    if (onlyName && String(r[1]).trim() !== String(onlyName).trim()) return;
+
+    // Manually edited: EndTime filled but status still RUNNING -> just mark ENDED
+    if (r[7]) { sh.getRange(i + 2, 10).setValue('ENDED'); closed++; return; }
+
+    const start = r[6] ? new Date(r[6]) : null;
+    if (!start || isNaN(start.getTime())) return;
+    if (fmtDate_(start) >= today) return;
+
+    let end = new Date(start.getFullYear(), start.getMonth(), start.getDate(), h, m, 0);
+    if (end <= start) end = new Date(start.getTime());
+
+    let breakMs = parseDurationToMs_(r[13]);
+    if (r[9] === 'ON BREAK' && r[11]) {
+      const bs = new Date(r[11]);
+      if (!isNaN(bs.getTime()) && bs < end) breakMs += (end - bs);
+    }
+    const totalMs = end - start;
+    const netMs = Math.max(0, totalMs - breakMs);
+    const rowNum = i + 2;
+
+    sh.getRange(rowNum, 8, 1, 4).setValues([[end, fmtHMS_(totalMs), 'ENDED', 'Auto-closed']]);
+    sh.getRange(rowNum, 12).setValue('');
+    sh.getRange(rowNum, 14).setValue(fmtHMS_(breakMs));
+    sh.getRange(rowNum, 15).setValue(fmtHMS_(netMs));
+    sh.getRange(rowNum, 16).setValue(((r[15] || '') + ' [Auto-closed: End not tapped]').trim());
+    closed++;
+  });
+  return closed;
+}
+
+function getActiveSession(name) {
+  withLock_(() => autoCloseStaleSessions_(name));
+  const found = findOpenRowForUser_(name);
+  if (!found) return { active: false };
+  const row = found.row;
+  return {
+    active: true,
+    project: row[2], task: row[3], subtask: row[4],
+    rowStatus: row[9],
+    startTime: row[6] ? new Date(row[6]).getTime() : null,
+    breakStart: row[11] ? new Date(row[11]).getTime() : null,
+    accumulatedBreakMs: parseDurationToMs_(row[13])
+  };
+}
+
+function hasAnyStartToday_(name, today) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === name && normalizeDateCell_(data[i][0]) === today) return true;
+  }
+  return false;
+}
+
+const NOTIFY_EMAIL = 'rebeccaraveena@gmail.com';
+
+function testEmailOnly() {
+  MailApp.sendEmail({ to: NOTIFY_EMAIL, subject: 'Test — BIM Bytes notification check',
+    body: 'If you got this, email notifications are working correctly.' });
+  Logger.log('Email sent attempt completed.');
+}
+
+// Public wrappers (locked). Internal versions end with _
+function saveStart(d)      { return withLock_(() => saveStart_(d)); }
+function saveEnd(d)        { return withLock_(() => saveEnd_(d)); }
+function saveBreakStart(d) { return withLock_(() => saveBreakStart_(d)); }
+function saveBreakEnd(d)   { return withLock_(() => saveBreakEnd_(d)); }
+
+function saveStart_(d) {
+  if (!d.name || !d.project || !d.task || !d.subtask || !d.startStatus) {
+    return { status: '⚠ Missing required fields.' };
+  }
+  autoCloseStaleSessions_(d.name);
+  const open = findOpenRowForUser_(d.name);
+  if (open) return { status: '⚠ You already have a running session (' + open.row[2] + ') — end it first.' };
+
+  const sh = sheet_('TimeLog');
+  const now = new Date();
+  const today = fmtDate_(now);
+  const clockInStr = fmtTime_(now);
+
+  let punctuality = '—';
+  if (!hasAnyStartToday_(d.name, today)) {
+    punctuality = clockInStr <= SHIFT_START ? 'On Time' : 'Late';
+  }
+
+  safeAppend_(sh, [
+    today, d.name, d.project, d.task, d.subtask, d.startStatus,
+    now, '', '', 'RUNNING', '', '', '', '00:00:00', '', d.comment || '', punctuality
+  ]);
+
+  logNotification_('START', 'TEAM', d.name, d.project, d.task, d.subtask,
+    d.name + ' started ' + d.task + ' on ' + d.project + ' at ' + clockInStr +
+      (punctuality !== '—' ? ' (' + punctuality + ')' : ''));
+
+  return { status: '✔ Started' + (punctuality !== '—' ? ' — ' + punctuality : '') };
+}
+
+function saveEnd_(d) {
+  if (!d.name || !d.endStatus) return { status: '⚠ Select End Status.' };
+  const found = findOpenRowForUser_(d.name);
+  if (!found) return { status: '⚠ No active session found.' };
+
+  const sh = sheet_('TimeLog');
+  const row = found.row;
+  const startTime = new Date(row[6]);
+  const endTime = new Date();
+  const totalMs = isNaN(startTime.getTime()) ? 0 : (endTime - startTime);
+  let breakTotalMs = parseDurationToMs_(row[13]);
+  if (row[9] === 'ON BREAK' && row[11]) {
+    const bs = new Date(row[11]);
+    if (!isNaN(bs.getTime())) breakTotalMs += (endTime - bs);
+  }
+  const netMs = Math.max(0, totalMs - breakTotalMs);
+
+  const existingComment = row[15] || '';
+  const endComment = d.comment ? String(d.comment).trim() : '';
+  const finalComment = endComment
+    ? (existingComment ? existingComment + ' | End: ' + endComment : endComment)
+    : existingComment;
+
+  const n = found.rowNum;
+  sh.getRange(n, 8).setValue(endTime);
+  sh.getRange(n, 9).setValue(fmtHMS_(totalMs));
+  sh.getRange(n, 10).setValue('ENDED');
+  sh.getRange(n, 11).setValue(d.endStatus);
+  sh.getRange(n, 12).setValue('');
+  sh.getRange(n, 14).setValue(fmtHMS_(breakTotalMs));
+  sh.getRange(n, 15).setValue(fmtHMS_(netMs));
+  sh.getRange(n, 16).setValue(finalComment);
+
+  return { status: '✔ Session ended', total: fmtHMS_(totalMs), net: fmtHMS_(netMs), brk: fmtHMS_(breakTotalMs) };
+}
+
+function saveBreakStart_(d) {
+  if (!d.name) return { status: '⚠ Not logged in.' };
+  const found = findOpenRowForUser_(d.name);
+  if (!found || found.row[9] !== 'RUNNING') return { status: '⚠ Start work first.' };
+  const sh = sheet_('TimeLog');
+  sh.getRange(found.rowNum, 10).setValue('ON BREAK');
+  sh.getRange(found.rowNum, 12).setValue(new Date());
+  return { status: '☕ Break started' };
+}
+
+function saveBreakEnd_(d) {
+  if (!d.name) return { status: '⚠ Not logged in.' };
+  const found = findOpenRowForUser_(d.name);
+  if (!found || found.row[9] !== 'ON BREAK') return { status: '⚠ No active break found.' };
+  const sh = sheet_('TimeLog');
+  const breakStart = new Date(found.row[11]);
+  const breakEnd = new Date();
+  const thisBreakMs = isNaN(breakStart.getTime()) ? 0 : (breakEnd - breakStart);
+  const newTotalBreakMs = parseDurationToMs_(found.row[13]) + thisBreakMs;
+
+  sh.getRange(found.rowNum, 10).setValue('RUNNING');
+  sh.getRange(found.rowNum, 12).setValue('');
+  sh.getRange(found.rowNum, 13).setValue(breakEnd);
+  sh.getRange(found.rowNum, 14).setValue(fmtHMS_(newTotalBreakMs));
+
+  return { status: '▶ Break ended — resuming work', breakMs: thisBreakMs };
+}
+
+function getMyTimeLogs(name) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === name) {
+      rows.push({
+        date: data[i][0], project: data[i][2],
+        clockIn: data[i][6] ? fmtTime_(new Date(data[i][6])) : '',
+        clockOut: data[i][7] ? fmtTime_(new Date(data[i][7])) : '',
+        punctuality: data[i][16],
+        productionMinutes: parseDurationToMs_(data[i][14]) / 60000
+      });
+    }
+  }
+  return rows.reverse();
+}
+
+function getMyProductionSummary(name) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const today = fmtDate_(new Date());
+  let totalProdMin = 0, todayProdMin = 0, onTime = 0, late = 0, sessions = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] !== name || !data[i][7]) continue;
+    sessions++;
+    const prodMin = parseDurationToMs_(data[i][14]) / 60000;
+    totalProdMin += prodMin;
+    if (normalizeDateCell_(data[i][0]) === today) todayProdMin += prodMin;
+    if (data[i][16] === 'On Time') onTime++;
+    else if (data[i][16] === 'Late') late++;
+  }
+  return { totalHours: fmtHMS_(totalProdMin * 60000), todayHours: fmtHMS_(todayProdMin * 60000),
+    sessions: sessions, onTime: onTime, late: late };
+}
+
+function getAllTimeLogs(role) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    rows.push({
+      name: data[i][1], date: data[i][0], project: data[i][2],
+      clockIn: data[i][6] ? fmtTime_(new Date(data[i][6])) : '',
+      clockOut: data[i][7] ? fmtTime_(new Date(data[i][7])) : '',
+      punctuality: data[i][16]
+    });
+  }
+  return rows.reverse();
+}
+
+function recalculateTimeLog(role) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = sheet_('TimeLog');
+  const data = sh.getDataRange().getValues();
+  let updated = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const startTime = row[6] ? new Date(row[6]) : null;
+    if (!startTime || isNaN(startTime.getTime())) continue;
+    sh.getRange(i + 1, 17).setValue(fmtTime_(startTime) <= SHIFT_START ? 'On Time' : 'Late');
+    const endTime = row[7] ? new Date(row[7]) : null;
+    if (!endTime || isNaN(endTime.getTime())) continue;
+    const totalMs = endTime - startTime;
+    const breakMs = parseDurationToMs_(row[13]);
+    const netMs = Math.max(0, totalMs - breakMs);
+    sh.getRange(i + 1, 9).setValue(fmtHMS_(totalMs));
+    sh.getRange(i + 1, 15).setValue(fmtHMS_(netMs));
+    // keep status consistent for manually edited rows
+    if (row[9] === 'RUNNING' || row[9] === 'ON BREAK') sh.getRange(i + 1, 10).setValue('ENDED');
+    updated++;
+  }
+  return { success: true, message: '✔ Recalculated ' + updated + ' completed session(s).' };
+}
+
+// ---------- MANUAL ENTRY IMPORT ----------
+function combineDateAndTime_(dateVal, timeVal) {
+  let year, month, day;
+  if (Object.prototype.toString.call(dateVal) === '[object Date]') {
+    year = dateVal.getFullYear(); month = dateVal.getMonth(); day = dateVal.getDate();
+  } else {
+    const d = new Date(dateVal);
+    if (isNaN(d.getTime())) return null;
+    year = d.getFullYear(); month = d.getMonth(); day = d.getDate();
+  }
+  let hour = 0, minute = 0, second = 0;
+  if (timeVal === '' || timeVal === null || timeVal === undefined) return null;
+  if (Object.prototype.toString.call(timeVal) === '[object Date]') {
+    hour = timeVal.getHours(); minute = timeVal.getMinutes(); second = timeVal.getSeconds();
+  } else {
+    const parts = String(timeVal).split(':').map(Number);
+    if (parts.length >= 2 && !parts.some(isNaN)) { hour = parts[0]; minute = parts[1]; second = parts[2] || 0; }
+    else return null;
+  }
+  return new Date(year, month, day, hour, minute, second);
+}
+
+function importManualEntries(role) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = sheet_('ManualEntry');
+  if (!sh) return { success: false, message: 'ManualEntry sheet not found.' };
+  const data = sh.getDataRange().getValues();
+  const timeLogSh = sheet_('TimeLog');
+  let imported = 0, skipped = 0;
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[10] === 'Yes') continue;
+    const [dateVal, name, project, task, subtask, inTimeVal, outTimeVal, breakMinutesVal, endStatus, comment] = row;
+    if (!name || !inTimeVal || !outTimeVal) { skipped++; continue; }
+    const startTime = combineDateAndTime_(dateVal, inTimeVal);
+    const endTime = combineDateAndTime_(dateVal, outTimeVal);
+    if (!startTime || !endTime) { skipped++; continue; }
+
+    const totalMs = Math.max(0, endTime - startTime);
+    const breakMs = (Number(breakMinutesVal) || 0) * 60000;
+    const netMs = Math.max(0, totalMs - breakMs);
+    const punctuality = fmtTime_(startTime) <= SHIFT_START ? 'On Time' : 'Late';
+
+    safeAppend_(timeLogSh, [
+      fmtDate_(startTime), name, project || 'Manual Entry', task || '', subtask || '', 'Start',
+      startTime, endTime, fmtHMS_(totalMs), 'ENDED', endStatus || 'Completed',
+      '', '', fmtHMS_(breakMs), fmtHMS_(netMs), (comment || '') + ' [Manual Entry]', punctuality
+    ]);
+    sh.getRange(i + 1, 11).setValue('Yes');
+    imported++;
+  }
+  return { success: true, message: '✔ Imported ' + imported + ' entr' + (imported === 1 ? 'y' : 'ies') +
+    (skipped ? ', skipped ' + skipped + ' incomplete row(s)' : '') };
+}
+
+// ---------- QC ----------
+function submitQCError(d) {
+  if (d.reviewerRole !== 'QC' && d.reviewerRole !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = sheet_('QCLog');
+  const now = new Date();
+  safeAppend_(sh, [
+    fmtDate_(now), fmtTime_(now), d.reviewerName, d.markedFor, d.discipline,
+    d.workType, d.subTask || '—', d.errorCount || 1, d.comment || '', d.project || '—'
+  ]);
+
+  const alertMsg = d.reviewerName + ' flagged ' + (d.errorCount || 1) +
+    ' error(s) on ' + d.project + ' — ' + d.discipline + ' / ' + d.workType +
+    (d.subTask && d.subTask !== '—' ? ' / ' + d.subTask : '') +
+    (d.comment ? ': "' + d.comment + '"' : '');
+
+  logNotification_('QC_ERROR', d.markedFor, d.reviewerName, d.project, d.workType, d.subTask, alertMsg, d.errorCount || 1, 'No');
+
+  const empEmail = getEmployeeEmail_(d.markedFor);
+  if (empEmail) {
+    try {
+      MailApp.sendEmail({ to: empEmail, subject: '🛡 QC error logged against you — ' + d.project,
+        body: alertMsg + '\n\nThis affects your Productivity score (see Performance Score in the app for details).' });
+    } catch (err) { console.error('QC alert email failed: ' + err.message); }
+  }
+  return { success: true };
+}
+
+function getQCLogs(role) {
+  if (role !== 'QC' && role !== 'Management') return { error: 'Not authorized.' };
+  const data = sheet_('QCLog').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    rows.push({
+      date: data[i][0], time: data[i][1], reviewer: data[i][2], markedFor: data[i][3],
+      discipline: data[i][4], workType: data[i][5], subTask: data[i][6],
+      errorCount: data[i][7], comment: data[i][8], project: data[i][9]
+    });
+  }
+  return rows.reverse();
+}
+
+// ---------- PERFORMANCE SCORE ----------
+const PUNCTUALITY_WEIGHT = 0.3;
+const PRODUCTIVITY_WEIGHT = 0.7;
+const STANDARD_WORKDAY_HOURS = 8;
+const POINTS_PER_ERROR = 2;
+const MAX_ERROR_PENALTY = 30;
+
+function computePunctualityStats_(name) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  let onTime = 0, late = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === name) {
+      if (data[i][16] === 'On Time') onTime++;
+      else if (data[i][16] === 'Late') late++;
+    }
+  }
+  return { onTime, late };
+}
+
+function computeProductivityStats_(name) {
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  let totalProdMin = 0;
+  const daysSet = {};
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === name) {
+      daysSet[normalizeDateCell_(data[i][0])] = true;
+      if (data[i][7]) totalProdMin += parseDurationToMs_(data[i][14]) / 60000;
+    }
+  }
+  return { totalProdMin, daysWorked: Object.keys(daysSet).length };
+}
+
+function countQCErrors_(name) {
+  const data = sheet_('QCLog').getDataRange().getValues();
+  let count = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][3] === name) count += Number(data[i][7]) || 1;
+  }
+  return count;
+}
+
+function computePerformanceScore_(name) {
+  const { onTime, late } = computePunctualityStats_(name);
+  const punctualityEntries = onTime + late;
+  const punctualityPct = punctualityEntries > 0 ? (onTime / punctualityEntries) * 100 : 100;
+
+  const { totalProdMin, daysWorked } = computeProductivityStats_(name);
+  const expectedMin = daysWorked * STANDARD_WORKDAY_HOURS * 60;
+  let productivityPctRaw = expectedMin > 0 ? (totalProdMin / expectedMin) * 100 : 0;
+  productivityPctRaw = Math.min(100, productivityPctRaw);
+
+  const errorCount = countQCErrors_(name);
+  const errorPenalty = Math.min(MAX_ERROR_PENALTY, errorCount * POINTS_PER_ERROR);
+  const productivityPct = Math.max(0, productivityPctRaw - errorPenalty);
+  const performanceScore = (punctualityPct * PUNCTUALITY_WEIGHT) + (productivityPct * PRODUCTIVITY_WEIGHT);
+  const ctx = getLeavePermissionContext_(name);
+
+  return {
+    name: name,
+    punctualityPct: Math.round(punctualityPct * 10) / 10,
+    productivityPct: Math.round(productivityPct * 10) / 10,
+    productivityPctBeforePenalty: Math.round(productivityPctRaw * 10) / 10,
+    performanceScore: Math.round(performanceScore * 10) / 10,
+    onTime: onTime, late: late, daysWorked: daysWorked,
+    totalHours: fmtHMS_(totalProdMin * 60000),
+    expectedHours: fmtHMS_(expectedMin * 60000),
+    errorCount: errorCount, errorPenalty: errorPenalty,
+    approvedLeaveCount: ctx.leaveCount, longPermissionCount: ctx.longPermissionCount
+  };
+}
+
+function getLeavePermissionContext_(name) {
+  let leaveCount = 0;
+  try {
+    const leaveData = ensureLeaveSheet_().getDataRange().getValues();
+    for (let i = 1; i < leaveData.length; i++) {
+      if (!leaveData[i][0]) continue;
+      if ((leaveData[i][4] || 'Approved') === 'Approved' && String(leaveData[i][1]).trim() === String(name).trim()) leaveCount++;
+    }
+  } catch (err) {}
+  let longPermissionCount = 0;
+  try {
+    const permData = ensurePermissionSheet_().getDataRange().getValues();
+    for (let i = 1; i < permData.length; i++) {
+      if (!permData[i][0]) continue;
+      const hours = Number(permData[i][5]) || 0;
+      if ((permData[i][4] || 'Approved') === 'Approved' && hours > 2 && String(permData[i][1]).trim() === String(name).trim()) longPermissionCount++;
+    }
+  } catch (err) {}
+  return { leaveCount: leaveCount, longPermissionCount: longPermissionCount };
+}
+
+function computeQCPoints_(name) {
+  const data = sheet_('QCLog').getDataRange().getValues();
+  let pointsAsReviewer = 0, pointsAsMarked = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][2] === name) pointsAsReviewer += 1;
+    if (data[i][3] === name) pointsAsMarked -= 1;
+  }
+  return { name: name, pointsAsReviewer: pointsAsReviewer, pointsAsMarked: pointsAsMarked,
+    totalQCPoints: pointsAsReviewer + pointsAsMarked };
+}
+
+function getMyQCPoints(name) { return computeQCPoints_(name); }
+
+function getAllQCPoints(role) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  const data = sheet_('Employees').getDataRange().getValues();
+  const results = [];
+  for (let i = 1; i < data.length; i++) if (data[i][0]) results.push(computeQCPoints_(data[i][0]));
+  results.sort((a, b) => b.totalQCPoints - a.totalQCPoints);
+  return results;
+}
+
+function getMyPerformanceScore(name) { return computePerformanceScore_(name); }
+
+function getAllPerformanceScores(role) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  const data = sheet_('Employees').getDataRange().getValues();
+  const results = [];
+  for (let i = 1; i < data.length; i++) if (data[i][0]) results.push(computePerformanceScore_(data[i][0]));
+  results.sort((a, b) => b.performanceScore - a.performanceScore);
+  return results;
+}
+
+// ---------- DASHBOARD ----------
+function getDashboardData(role, name) {
+  const isMgmt = role === 'Management';
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[0] || !r[1]) continue;
+    if (!isMgmt && String(r[1]).trim() !== String(name).trim()) continue;
+    rows.push({
+      rowIndex: i + 1,
+      date: normalizeDateCell_(r[0]),
+      name: r[1],
+      project: String(r[2] || '').trim(),
+      taskType: String(r[3] || '').trim(),
+      subTask: r[4] || '',
+      startTime: r[6] ? fmtTime_(new Date(r[6])) : '',
+      endTime: r[7] ? fmtTime_(new Date(r[7])) : '',
+      rowStatus: r[9] || '',
+      endStatus: r[10] || '',
+      netMs: parseDurationToMs_(r[14]),
+      netHrs: Math.round((parseDurationToMs_(r[14]) / 3600000) * 100) / 100,
+      comments: r[15] || '',
+      punctuality: r[16] || '',
+      verifiedBy: r[17] || '',
+      verifiedAt: r[18] ? fmtDate_(new Date(r[18])) : ''
+    });
+  }
+  return rows;
+}
+
+// ---------- NOTIFICATIONS ----------
+const NOTIFICATIONS_HEADERS_ = ['Timestamp','Type','TargetName','FromName','Project','TaskType','SubTask','Message','ErrorCount','Read'];
+
+function ensureNotificationsSheet_() {
+  return getOrCreateSheet_('Notifications', NOTIFICATIONS_HEADERS_);
+}
+
+function logNotification_(type, targetName, fromName, project, taskType, subTask, message, errorCount, isRead) {
+  try {
+    safeAppend_(ensureNotificationsSheet_(),
+      [new Date(), type, targetName, fromName, project || '', taskType || '', subTask || '', message, errorCount || '', isRead || '']);
+  } catch (err) {
+    console.error('logNotification_ failed: ' + err.message);
+  }
+}
+
+function getLongRunningSessions(role, thresholdHours) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  thresholdHours = thresholdHours || 4;
+  const data = sheet_('TimeLog').getDataRange().getValues();
+  const now = new Date();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if ((r[9] !== 'RUNNING' && r[9] !== 'ON BREAK') || r[7]) continue;
+    const startTime = r[6] ? new Date(r[6]) : null;
+    if (!startTime || isNaN(startTime.getTime())) continue;
+    const hoursElapsed = (now - startTime) / 3600000;
+    if (hoursElapsed < thresholdHours) continue;
+    rows.push({ name: r[1], project: r[2], taskType: r[3], rowStatus: r[9],
+      startedAt: fmtTime_(startTime) + ' · ' + fmtDate_(startTime),
+      hoursElapsed: Math.round(hoursElapsed * 10) / 10 });
+  }
+  return rows.sort((a, b) => b.hoursElapsed - a.hoursElapsed);
+}
+
+function getMissedClockIns(role, thresholdHours) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  thresholdHours = thresholdHours || 4;
+  const now = new Date();
+  const today = fmtDate_(now);
+  const [shiftH, shiftM] = SHIFT_START.split(':').map(Number);
+  const shiftStartToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), shiftH, shiftM, 0);
+  const hoursSince = (now - shiftStartToday) / 3600000;
+  if (hoursSince < thresholdHours) return [];
+
+  const empData = sheet_('Employees').getDataRange().getValues();
+  const allNames = [];
+  for (let i = 1; i < empData.length; i++) {
+    if (empData[i][0] && empData[i][2] !== 'Management') allNames.push(String(empData[i][0]).trim());
+  }
+  const logData = sheet_('TimeLog').getDataRange().getValues();
+  const clockedInToday = new Set();
+  for (let i = 1; i < logData.length; i++) {
+    if (normalizeDateCell_(logData[i][0]) === today) clockedInToday.add(String(logData[i][1]).trim());
+  }
+  return allNames.filter(n => !clockedInToday.has(n))
+    .map(n => ({ name: n, hoursSinceShiftStart: Math.round(hoursSince * 10) / 10 }));
+}
+
+function getNotStartedToday(role) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  const today = fmtDate_(new Date());
+  const now = new Date();
+
+  const empData = sheet_('Employees').getDataRange().getValues();
+  const allNames = [], weekOffMap = {}, altSaturdayMap = {};
+  for (let i = 1; i < empData.length; i++) {
+    if (empData[i][0] && empData[i][2] !== 'Management') {
+      const nm = String(empData[i][0]).trim();
+      allNames.push(nm);
+      weekOffMap[nm] = String(empData[i][9] || '').trim();
+      altSaturdayMap[nm] = String(empData[i][10] || '').trim();
+    }
+  }
+  const logData = sheet_('TimeLog').getDataRange().getValues();
+  const startedToday = new Set();
+  for (let i = 1; i < logData.length; i++) {
+    if (normalizeDateCell_(logData[i][0]) === today) startedToday.add(String(logData[i][1]).trim());
+  }
+  const leaveData = ensureLeaveSheet_().getDataRange().getValues();
+  const onLeaveToday = new Set();
+  for (let i = 1; i < leaveData.length; i++) {
+    if (!leaveData[i][0]) continue;
+    if ((leaveData[i][4] || 'Approved') !== 'Approved') continue;
+    if (normalizeDateCell_(leaveData[i][0]) === today) onLeaveToday.add(String(leaveData[i][1]).trim());
+  }
+  return allNames
+    .filter(n => !startedToday.has(n))
+    .filter(n => !isWeekOffDay_(weekOffMap[n], altSaturdayMap[n], now))
+    .filter(n => !onLeaveToday.has(n))
+    .sort();
+}
+
+function getTeamActivityFeed(limit) {
+  limit = limit || 15;
+  const data = ensureNotificationsSheet_().getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][2] !== 'TEAM') continue;
+    rows.push({
+      timestamp: data[i][0] ? fmtTime_(new Date(data[i][0])) + ' · ' + fmtDate_(new Date(data[i][0])) : '',
+      message: data[i][7]
+    });
+  }
+  return rows.reverse().slice(0, limit);
+}
+
+function getMyQCAlerts(name, limit) {
+  limit = limit || 25;
+  const data = ensureNotificationsSheet_().getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] !== 'QC_ERROR' || data[i][2] !== name) continue;
+    rows.push({
+      date: data[i][0] ? fmtDate_(new Date(data[i][0])) : '',
+      time: data[i][0] ? fmtTime_(new Date(data[i][0])) : '',
+      reviewer: data[i][3], project: data[i][4], taskType: data[i][5], subTask: data[i][6],
+      message: data[i][7], errorCount: data[i][8], isRead: data[i][9] === 'Yes'
+    });
+  }
+  return rows.reverse().slice(0, limit);
+}
+
+function getQCAlertsFor(role, targetName) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  return getMyQCAlerts(targetName, 50);
+}
+
+function countUnreadQCAlerts(name) {
+  const data = ensureNotificationsSheet_().getDataRange().getValues();
+  let count = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === 'QC_ERROR' && data[i][2] === name && data[i][9] !== 'Yes') count++;
+  }
+  return count;
+}
+
+function markMyQCAlertsRead(name) {
+  const sh = ensureNotificationsSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === 'QC_ERROR' && data[i][2] === name && data[i][9] !== 'Yes') {
+      sh.getRange(i + 1, 10).setValue('Yes');
+    }
+  }
+  return { success: true };
+}
+
+function getEmployeeEmail_(name) {
+  const data = sheet_('Employees').getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(name).trim()) {
+      const maybeEmail = data[i][4];
+      if (maybeEmail && String(maybeEmail).indexOf('@') !== -1) return String(maybeEmail).trim();
+      return null;
+    }
+  }
+  return null;
+}
+
+// ---------- VERIFICATION ----------
+function verifyEntry(role, verifierName, rowIndex) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const sh = sheet_('TimeLog');
+  sh.getRange(rowIndex, 18).setValue(verifierName);
+  sh.getRange(rowIndex, 19).setValue(new Date());
+  return { success: true, message: '✔ Verified' };
+}
+
+function getVerificationHistory(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  try {
+    limit = limit || 50;
+    const data = sheet_('TimeLog').getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      const r = data[i];
+      if (!r[17]) continue;
+      rows.push({
+        date: normalizeDateCell_(r[0]), name: r[1], project: r[2], taskType: r[3],
+        verifiedBy: r[17],
+        verifiedAt: r[18] ? fmtDate_(new Date(r[18])) + ' ' + fmtTime_(new Date(r[18])) : ''
+      });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load verification history: ' + err.message };
+  }
+}
+
+// ---------- COMMENT EDIT REQUESTS ----------
+function ensureCommentRequestsSheet_() {
+  return getOrCreateSheet_('CommentEditRequests',
+    ['Timestamp','RequestedBy','RowIndex','Date','Project','TaskType','OldComment','NewComment','Status','ReviewedBy','ReviewedAt']);
+}
+
+function updateComment(name, rowIndex, newComment) {
+  if (newComment === null || newComment === undefined || String(newComment).trim() === '') {
+    return { success: false, message: 'Comment cannot be empty.' };
+  }
+  const sh = sheet_('TimeLog');
+  const row = sh.getRange(rowIndex, 1, 1, 5).getValues()[0];
+  if (String(row[1]).trim() !== String(name).trim()) return { success: false, message: 'You can only edit your own entries.' };
+  const trimmed = String(newComment).trim();
+  sh.getRange(rowIndex, 16).setValue(trimmed);
+  logNotification_('COMMENT_UPDATED', 'MANAGEMENT', name, row[2], row[3], row[4],
+    name + ' updated the comment for ' + normalizeDateCell_(row[0]) + ' (' + row[2] + ' / ' + row[3] + '): "' + trimmed + '"', '', '');
+  return { success: true, message: '✔ Comment updated.' };
+}
+
+function requestCommentEdit(name, rowIndex, date, project, taskType, oldComment, newComment) {
+  if (newComment === null || newComment === undefined || String(newComment).trim() === '') {
+    return { success: false, message: 'Comment cannot be empty.' };
+  }
+  safeAppend_(ensureCommentRequestsSheet_(),
+    [new Date(), name, rowIndex, date, project, taskType, oldComment || '', newComment, 'Pending', '', '']);
+  return { success: true, message: '✔ Submitted for approval.' };
+}
+
+function getMyCommentRequests(name, limit) {
+  limit = limit || 20;
+  const data = ensureCommentRequestsSheet_().getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] !== name) continue;
+    rows.push({
+      date: data[i][3], project: data[i][4], taskType: data[i][5],
+      oldComment: data[i][6], newComment: data[i][7], status: data[i][8],
+      reviewedBy: data[i][9], reviewedAt: data[i][10] ? fmtDate_(new Date(data[i][10])) : ''
+    });
+  }
+  return rows.reverse().slice(0, limit);
+}
+
+function getPendingCommentRequests(role, limit) {
+  if (role !== 'Management') return { error: 'Not authorized.' };
+  try {
+    limit = limit || 50;
+    const data = ensureCommentRequestsSheet_().getDataRange().getValues();
+    const rows = [], recent = [];
+    for (let i = 1; i < data.length; i++) {
+      const requestedBy = data[i][1];
+      if (!requestedBy) continue;
+      const status = String(data[i][8] || '').trim().toLowerCase();
+      recent.push(requestedBy + ' — ' + data[i][4] + '/' + data[i][5] + ' — status=[' + data[i][8] + ']');
+      if (status !== 'pending') continue;
+      rows.push({ requestRow: i + 1, requestedBy: requestedBy, timeLogRow: data[i][2],
+        date: data[i][3], project: data[i][4], taskType: data[i][5],
+        oldComment: data[i][6], newComment: data[i][7] });
+    }
+    return { rows: rows.reverse().slice(0, limit), recent: recent.slice(-5).reverse() };
+  } catch (err) {
+    return { error: 'Could not load pending approvals: ' + err.message };
+  }
+}
+
+function reviewCommentRequest(role, reviewerName, requestRow, decision) {
+  if (role !== 'Management') return { success: false, message: 'Not authorized.' };
+  const reqSh = ensureCommentRequestsSheet_();
+  const data = reqSh.getDataRange().getValues();
+  const row = data[requestRow - 1];
+  if (!row || row[8] !== 'Pending') return { success: false, message: 'Request not found or already reviewed.' };
+  reqSh.getRange(requestRow, 9).setValue(decision);
+  reqSh.getRange(requestRow, 10).setValue(reviewerName);
+  reqSh.getRange(requestRow, 11).setValue(new Date());
+  if (decision === 'Approved') sheet_('TimeLog').getRange(row[2], 16).setValue(row[7]);
+  logNotification_(
+    decision === 'Approved' ? 'COMMENT_APPROVED' : 'COMMENT_REJECTED',
+    row[1], reviewerName, row[4], row[5], '',
+    'Your comment edit on ' + row[4] + ' (' + row[3] + ') was ' + decision.toLowerCase() + ' by ' + reviewerName + '.', '', '');
+  return { success: true, message: '✔ Request ' + decision.toLowerCase() + '.' };
+}
+
+function getMyNotifications(name, role, limit) {
+  try {
+    limit = limit || 15;
+    const data = ensureNotificationsSheet_().getDataRange().getValues();
+    const rows = [];
+    for (let i = 1; i < data.length; i++) {
+      const target = data[i][2];
+      if (data[i][1] === 'START') continue;
+      const isMine = target === name;
+      const isMgmtBroadcast = (role === 'Management' && target === 'MANAGEMENT');
+      if (!isMine && !isMgmtBroadcast) continue;
+      const isRead = data[i][9] === 'Yes';
+      if (isMgmtBroadcast && isRead) continue;
+      let ts = '';
+      try {
+        if (data[i][0]) { const d = new Date(data[i][0]); if (!isNaN(d.getTime())) ts = fmtTime_(d) + ' · ' + fmtDate_(d); }
+      } catch (e) { ts = ''; }
+      rows.push({ notifRow: i + 1, timestamp: ts, type: data[i][1], message: data[i][7], dismissable: isMgmtBroadcast });
+    }
+    return rows.reverse().slice(0, limit);
+  } catch (err) {
+    return { error: 'Could not load notifications: ' + err.message };
+  }
+}
+
+function markNotificationRead(notifRow) {
+  ensureNotificationsSheet_().getRange(notifRow, 10).setValue('Yes');
+  return { success: true };
+}
